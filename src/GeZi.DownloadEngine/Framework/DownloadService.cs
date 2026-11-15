@@ -1067,6 +1067,54 @@ public class DownloadService : AbstractDownloadService
     }
 
     /// <summary>
+    /// 续传位图与本地数据文件是否对得上。
+    /// <para>位图只描述「哪些分片下过」，从不描述「那份数据还在不在」。文件被删掉后
+    /// 残留的位图会被无条件采信，于是只补最后几个分片、其余位置保留预分配的全零 ——
+    /// 这正是「长度对、内容全零、MD5 必错」的来源。</para>
+    /// <para>判据：文件必须存在、长度大于 0，且不短于位图里已标记完成的分片终点。
+    /// 预分配的文件长度 = 总长，正常续传一定满足；只有「文件被删后重建」才会短于它。</para>
+    /// </summary>
+    private bool DataFileMatchesResume(ResumeState state)
+    {
+        try
+        {
+            if (state == null || string.IsNullOrEmpty(_resumeKey) || !File.Exists(_resumeKey))
+            {
+                return false;
+            }
+
+            long length = new FileInfo(_resumeKey).Length;
+            if (length <= 0)
+            {
+                return false;
+            }
+
+            ResumeChunk[] chunks = state.Chunks;
+            if (chunks == null || chunks.Length == 0)
+            {
+                return false;
+            }
+
+            long highestComplete = 0;
+            for (int i = 0; i < chunks.Length; i++)
+            {
+                ResumeChunk chunk = chunks[i];
+                if (chunk != null && chunk.IsComplete && chunk.End > highestComplete)
+                {
+                    highestComplete = chunk.End;
+                }
+            }
+
+            return length >= highestComplete;
+        }
+        catch
+        {
+            // 判不了就当对不上：宁可重下，也不要产出坏文件
+            return false;
+        }
+    }
+
+    /// <summary>
     /// 读续传状态。任何不一致（总长变了、资源标识变了、分片表不连续）都当没有续传并清掉旧状态。
     /// </summary>
     private async Task<ResumeState> LoadResumeAsync(long totalBytes, string validatorValue, CancellationToken cancel)    {
@@ -1092,6 +1140,20 @@ public class DownloadService : AbstractDownloadService
 
         if (state == null)
         {
+            return null;
+        }
+
+        // 🚨 2026-11-15：位图只记「哪些分片下过」，不记「数据还在不在」。
+        //    实测事故链路：同一路径上有两条同名任务（续传批重复添加），
+        //    删掉其中一条时按路径把数据文件删了，位图却留了下来
+        //    （取消分支的 catch 会再写一次 .geziresume）；重启后位图声称 99.9% 完成，
+        //    落盘层新建一个全零文件，只补最后 0.1% → 长度对、内容全零，MD5 必错。
+        //    这里补一道落地核对：目标文件不存在、或短于位图声称的完成位置，
+        //    一律作废位图整份重下 —— 重下的代价是一次传输，留着坏文件的代价是用户白等几小时。
+        if (!DataFileMatchesResume(state))
+        {
+            _logger?.LogWarning("续传位图还在，但本地数据文件已不存在或不完整 → 作废位图，整份重下");
+            await ClearResumeAsync().ConfigureAwait(false);
             return null;
         }
 

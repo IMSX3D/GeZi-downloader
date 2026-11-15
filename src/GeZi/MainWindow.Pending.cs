@@ -104,6 +104,31 @@ namespace GeZi
         }
 
         /// <summary>
+        /// 是否还有**别的**「活着的」任务引用同一个本地路径。
+        /// <para>用于两处安全判定：①续传批添加任务前，避免同一路径出现第二条任务；
+        /// ②「删除并移除」删本地文件前，避免把别人正在写的文件一起删掉
+        /// （历史事故：14:48 连删 8 个 K115.partXX.rar，随后位图残留产出全零文件）。</para>
+        /// <para>必须在 UI 线程调用（读 _tasks）。</para>
+        /// </summary>
+        private bool HasOtherLiveTaskForDest(string dest, TaskItem self)
+        {
+            if (string.IsNullOrEmpty(dest)) return false;
+            try
+            {
+                foreach (var other in _tasks)
+                {
+                    if (other == null || ReferenceEquals(other, self) || other.Job == null) continue;
+                    if (!string.Equals(other.Job.Dest, dest, StringComparison.OrdinalIgnoreCase)) continue;
+                    if (other.State == JobState.Downloading || other.State == JobState.Queued
+                        || other.State == JobState.Paused || other.State == JobState.Cancelling)
+                        return true;
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        /// <summary>
         /// 把当前"未完成"的任务（排队/下载/暂停）写进持久化记录，
         /// 已完成的从记录里移除。供下次启动提示"有 N 个未完成任务"。
         /// 节流：只有"未完成任务的名字 + 状态 + 落盘路径"组合变了才真正写盘 ——
@@ -1695,23 +1720,48 @@ namespace GeZi
                 }
 
                 LogAllocation(alloc);
-                // 一次性加：续传可能一次恢复几十上百条，逐条加会让分组视图反复重排
-                var resumedRows = new List<TaskItem>(jobs.Count);
-                foreach (var job in jobs)
-                    resumedRows.Add(new TaskItem(job, job.Name));
-
-                // 🚨 2026-11-01：这三步**全是 UI 操作**（改 _tasks 集合、刷日志框、
-                //   启动任务并把状态推给界面）。上面有大量 ConfigureAwait(false)，
-                //   到这里很可能已经在线程池线程上 —— 直接调会抛
-                //   InvalidOperationException（"另一个线程拥有该对象"），
-                //   而且是**静默**抛在 async void / 未观察 Task 里，用户只看到
-                //   「任务加进来了但一直排队、没速度」。必须整体切回主线程。
+                // 🚨 2026-11-15：先在这里把「同路径已经在跑」的任务剔掉，再建行。
+                //    原来无条件 AddTaskRows + RunJobs —— 用户在任务卡住时点「继续下载」，
+                //    同一路径就变成两条任务：两条任务写同一个文件、共用同一份 .geziresume，
+                //    删掉其中一条会把数据文件一起删掉（14:48 事故），残留位图又会
+                //    让下一次续传只补 0.1%、其余全是预分配的全零。
+                //    这一步必须读 _tasks，所以整段放进 UI 线程。
                 RunOnUi(() =>
                 {
-                    AddTaskRows(resumedRows);
-                    Log("已续传 " + jobs.Count + " 个任务。");
-                    RunJobs(jobs);
+                    var keepJobs = new List<DownloadJob>(jobs.Count);
+                    var keepRows = new List<TaskItem>(jobs.Count);
+                    int skippedDup = 0;
+                    foreach (var job in jobs)
+                    {
+                        if (job == null) continue;
+                        if (HasOtherLiveTaskForDest(job.Dest, null))
+                        {
+                            skippedDup++;
+                            continue;
+                        }
+
+                        keepJobs.Add(job);
+                        // 一次性加：续传可能一次恢复几十上百条，逐条加会让分组视图反复重排
+                        keepRows.Add(new TaskItem(job, job.Name));
+                    }
+
+                    if (skippedDup > 0)
+                    {
+                        Log(string.Format(
+                            "已跳过 {0} 个同名任务：该路径已有任务在跑，不会再起第二条", skippedDup));
+                    }
+
+                    if (keepRows.Count == 0)
+                    {
+                        Log("没有需要续传的任务（同名文件已在下载中）。");
+                        return;
+                    }
+
+                    AddTaskRows(keepRows);
+                    Log("已续传 " + keepJobs.Count + " 个任务。");
+                    RunJobs(keepJobs);
                 });
+
             }
             finally
             {
