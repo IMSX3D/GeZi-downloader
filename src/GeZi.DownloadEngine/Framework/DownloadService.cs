@@ -107,12 +107,14 @@ public class DownloadService : AbstractDownloadService
     // 于是任务永久停在 99.9%：不报成功、不报失败、连接也不放，界面看起来像卡死。
     //
     // 判据用「产物级」而不是「请求级」：已收到字节数连续 StallAbortMinutes 分钟没增加，
-    // 就主动取消本次下载（走既有的取消路径，续传位图保留），让上层把任务标成
-    // 「失败 + 原因」并释放连接。用户点「继续」会重新取直链，从断点接着下。
+    // 就主动取消本次下载（走既有的取消路径，续传位图保留），并抛 LinkStalledException
+    // 交给上层 —— FusionDownloader 认得它，会**自动重新取一张直链**再从断点接着下，
+    // 用户看到的是「正在重新取链」而不是任务死掉。换链次数用尽才最终报失败。
     //
-    // 阈值取 10 分钟：真在下的任务每帧都在涨字节数，慢到 1 KB/s 也会重置计时；
+    // 阈值取 6 分钟：真在下的任务每帧都在涨字节数，慢到 1 KB/s 也会重置计时；
     // 只有「一个字节都不进」才会命中，不会误杀慢速任务。
-    private const int StallAbortMinutes = 10;
+    // 之所以不再取更长：现在恢复是自动的，等得越久只是白等（实测卡死的那次白等了 2 小时）。
+    private const int StallAbortMinutes = 6;
     private long _stallLastBytes = -1;
     private DateTime _stallLastAdvanceUtc = DateTime.UtcNow;
     private bool _stallAbortRequested;
@@ -521,17 +523,17 @@ public class DownloadService : AbstractDownloadService
                 await SaveResumeSnapshotAsync(CancellationToken.None).ConfigureAwait(false);
             }
             // 🚨 2026-11-15：这次「取消」不是用户点的，是停滞看门狗发起的。
-            //   必须报「失败 + 原因」，不能沿用「已取消」：界面显示「已暂停」时
-            //   用户完全看不出发生了什么，只会以为程序又把任务丢了。
-            //   续传位图照常保留（上面的 deleteRemove 分支已处理），点「继续」即可接着下。
+            //   不报「已取消」（界面会显示成「已暂停」，用户根本看不出发生了什么），
+            //   而是抛 LinkStalledException —— 上层（FusionDownloader）认得它，
+            //   会**自动重新取一张直链**再从断点接着下，用户只看到一行「正在重新取链」。
+            //   只有换链次数真的用完，才会最终作为失败上报。
             if (_stallAbortRequested)
             {
-                var stallError = new TimeoutException(
-                    "连续 " + StallAbortMinutes + " 分钟没有任何进度：最后几个分片的请求被服务端反复拒绝，"
-                    + "直链多半已过期。已停止本次下载，进度已保存 —— 点「继续」会重新获取直链并从断点接着下。");
-                _logger?.LogError(stallError, "本次下载因长期无进展被中止。");
-                await SendDownloadCompletionSignal(DownloadStatus.Failed, stallError).ConfigureAwait(false);
-                return Package.Storage?.OpenRead();
+                var stallError = new LinkStalledException(
+                    "连续 " + StallAbortMinutes + " 分钟没有任何字节落盘：最后几个分片的请求被服务端反复拒绝，"
+                    + "直链多半已过期。");
+                _logger?.LogError(stallError, "本次下载因长期无进展被中止，交由上层重新取链。");
+                throw stallError;
             }
 
             await SendDownloadCompletionSignal(DownloadStatus.Stopped, exp).ConfigureAwait(false);
@@ -1478,7 +1480,7 @@ public class DownloadService : AbstractDownloadService
             _logger?.LogError("停滞中止：" + StallAbortMinutes
                 + " 分钟没有任何字节落盘（已完成 " + done + "/" + package.TotalFileSize
                 + " 字节）。剩下的分片多半已经取不回来 —— 直链过期，或 CDN 持续拒绝这几个区间。"
-                + "本次下载已停止，进度已保存；点「继续」会重新获取直链，从断点接着下。");
+                + "本次尝试已停止，进度全部保留，接下来会自动重新取一张直链接着下。");
 
             // 用取消把在途连接收干净：worker 观察到取消就放手，
             // 不会留下一堆占着连接却不再产数据的 socket。

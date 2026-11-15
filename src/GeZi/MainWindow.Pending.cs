@@ -1593,6 +1593,9 @@ namespace GeZi
                             Name = p.Name ?? Path.GetFileName(dest),
                             Url = url,
                             Dest = dest,
+                            // 2026-11-15：续传取链同样是「先取好再排队」，同样要记签发时间，
+                            // 否则重启后一批续传里排在后面的任务会拿着过期链开跑。
+                            UrlIssuedUtc = DateTime.UtcNow,
                             // 🚨 续传也必须按「这条任务来自哪家网盘」带全套下载头。
                             //    原来这里一个头都没设 → 下载器全部回落到夸克默认值：
                             //    阿里 OSS 400（签名绑 Referer）、迅雷 403、UC 403（Referer/UA 都要 UC 的）
