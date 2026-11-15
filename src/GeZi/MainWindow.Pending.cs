@@ -299,13 +299,32 @@ namespace GeZi
                 //   磁盘记录若落在这些 Dest 上，说明它对应的任务已经结束，不再保留。
                 //   ⚠️ 只排除终态（Completed/Failed/Cancelled）；Cancelling 是非终态
                 //      （强杀时分片可能还没清完），必须继续保留 —— AGENTS.md 二十一节红线。
+                //   ⚠️ Failed 自 2026-11-15 起不是无条件终态：见下面分支的注释。
                 var terminalDests = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                bool keepFailedForResume = false;
                 foreach (var t in _tasks)
                 {
                     if (t?.Job == null || string.IsNullOrEmpty(t.Job.Dest)) continue;
-                    if (t.State == JobState.Completed || t.State == JobState.Failed
-                        || t.State == JobState.Cancelled)
+                    if (t.State == JobState.Completed || t.State == JobState.Cancelled)
                         terminalDests.Add(t.Job.Dest);
+                    else if (t.State == JobState.Failed)
+                    {
+                        // 🚨 2026-11-15：失败 ≠ 没救了。
+                        //   停滞看门狗（DownloadService.CheckStall）把「10 分钟一个字节都不进」
+                        //   报成 Failed，这类任务**续传位图还在、文件也还在**，重新取一次直链
+                        //   就能从断点接着下。若照旧把 Failed 一律当终态，SyncPending 会把它的
+                        //   「未完待续」记录丢掉 → 用户想继续时连入口都没了，只能从网盘重加。
+                        //   判据用位图是否存在：正常收尾成功后 ClearResumeAsync 会删掉它，
+                        //   所以「有 .geziresume」= 还有残活要收，必须保留入口。
+                        if (File.Exists(t.Job.Dest + ".geziresume"))
+                        {
+                            keepFailedForResume = true;
+                        }
+                        else
+                        {
+                            terminalDests.Add(t.Job.Dest);
+                        }
+                    }
                 }
 
                 // ③ 保留磁盘上有、但这一轮没进 _tasks 的记录。
@@ -340,6 +359,10 @@ namespace GeZi
                 //   右上角「未完成」徽章就一直不刷新。
                 if (terminalDests.Count > 0)
                     sig += "#T" + terminalDests.Count;
+                // 有「失败但还能续」的任务时也要让签名发生变化，
+                // 否则徽章/磁盘记录可能因为签名恰好相同而被早退吞掉。
+                if (keepFailedForResume)
+                    sig += "#K";
                 if (sig == _pendingSig)
                     return;
                 _pendingSig = sig;
